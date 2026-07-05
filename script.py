@@ -17,7 +17,10 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
-# GOOGLE SHEETS
+# ==========================================
+# GOOGLE SHEETS AUTH
+# ==========================================
+
 creds_info = json.loads(os.getenv("CREDENTIALS"))
 
 creds = Credentials.from_service_account_info(
@@ -30,35 +33,35 @@ sheet = client.open(SPREADSHEET_NAME).sheet1
 
 
 # ==========================================
-# WEBHOOK ENDPOINT
+# WEBHOOK
 # ==========================================
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.json
-
-    # сюда ты будешь дергать триггер
-
     try:
-        run_sync()   # запускаем твой старый код
+        run_sync()
         return jsonify({"status": "ok"})
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 # ==========================================
-# ТВОЙ ОСНОВНОЙ КОД (обернут в функцию)
+# MAIN LOGIC
 # ==========================================
 
 def run_sync():
 
-    records = sheet.get_all_records()
+    # ✔ читаем только колонку post_id (B)
+    values = sheet.col_values(2)[1:]
 
     existing_posts = {}
+    for i, post_id in enumerate(values, start=1):
+        if post_id:
+            existing_posts[str(post_id)] = i
 
-    for row_number, record in enumerate(records, start=2):
-        existing_posts[str(record["post_id"])] = row_number
+    # ==========================================
+    # VK API
+    # ==========================================
 
     url = "https://api.vk.com/method/wall.get"
 
@@ -74,6 +77,13 @@ def run_sync():
 
     posts = data["response"]["items"]
     posts.sort(key=lambda x: x["date"])
+
+    # ==========================================
+    # COLLECT UPDATES
+    # ==========================================
+
+    batch_updates = []
+    rows_to_add = []
 
     for post in posts:
 
@@ -92,24 +102,42 @@ def run_sync():
         reposts = post.get("reposts", {}).get("count", 0)
         views = post.get("views", {}).get("count", 0)
 
-        cr = round(((reactions + comments + reposts) / views) * 100, 2) if views else 0
+        cr = round(((reactions + comments + reposts) / views), 2) if views else 0
+
+        # ==========================================
+        # UPDATE OR INSERT
+        # ==========================================
 
         if post_id in existing_posts:
+
             row = existing_posts[post_id]
 
-            sheet.batch_update([{
+            batch_updates.append({
                 "range": f"C{row}:H{row}",
                 "values": [[reactions, comments, reposts, views, cr, text]]
-            }])
+            })
 
         else:
-            sheet.append_row([
-                date, post_id, reactions, comments, reposts, views, cr, text
+
+            rows_to_add.append([
+                date, post_id,
+                reactions, comments, reposts,
+                views, cr, text
             ])
 
+    # ==========================================
+    # SINGLE BATCH REQUESTS (IMPORTANT)
+    # ==========================================
+
+    if batch_updates:
+        sheet.batch_update(batch_updates)
+
+    if rows_to_add:
+        sheet.append_rows(rows_to_add)
+    
 
 # ==========================================
-# HEALTH CHECK (обязательно для Render)
+# HEALTH CHECK
 # ==========================================
 
 @app.route("/", methods=["GET"])
