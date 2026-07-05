@@ -1,3 +1,4 @@
+from flask import Flask, request, jsonify
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
@@ -5,24 +6,19 @@ from datetime import datetime
 import json
 import os
 
-# ==========================================
-# НАСТРОЙКИ
-# ==========================================
+app = Flask(__name__)
 
 VK_TOKEN = os.getenv("VK_TOKEN")
 DOMAIN = "foot_ball_today"
 SPREADSHEET_NAME = "vk_analytics"
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
 
-# ==========================================
 # GOOGLE SHEETS
-# ==========================================
-creds_json = os.getenv("CREDENTIALS")
-
-creds_info = json.loads(creds_json)
+creds_info = json.loads(os.getenv("CREDENTIALS"))
 
 creds = Credentials.from_service_account_info(
     creds_info,
@@ -32,148 +28,98 @@ creds = Credentials.from_service_account_info(
 client = gspread.authorize(creds)
 sheet = client.open(SPREADSHEET_NAME).sheet1
 
-# ==========================================
-# ЧИТАЕМ ТАБЛИЦУ
-# ==========================================
-
-records = sheet.get_all_records()
-
-# post_id -> номер строки
-existing_posts = {}
-
-for row_number, record in enumerate(records, start=2):
-    existing_posts[str(record["post_id"])] = row_number
 
 # ==========================================
-# ПОЛУЧАЕМ ПОСТЫ VK
+# WEBHOOK ENDPOINT
 # ==========================================
 
-url = "https://api.vk.com/method/wall.get"
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.json
 
-params = {
-    "domain": DOMAIN,
-    "count": 100,
-    "access_token": VK_TOKEN,
-    "v": "5.199"
-}
+    # сюда ты будешь дергать триггер
 
-response = requests.get(url, params=params)
-data = response.json()
+    try:
+        run_sync()   # запускаем твой старый код
+        return jsonify({"status": "ok"})
 
-if "response" not in data:
-    raise Exception(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-posts = data["response"]["items"]
-
-# Сортировка по дате
-posts.sort(key=lambda x: x["date"])
 
 # ==========================================
-# ГОТОВИМ ИЗМЕНЕНИЯ
+# ТВОЙ ОСНОВНОЙ КОД (обернут в функцию)
 # ==========================================
 
-rows_to_add = []
-batch_updates = []
+def run_sync():
 
-new_posts = 0
-updated_posts = 0
+    records = sheet.get_all_records()
 
-for post in posts:
+    existing_posts = {}
 
-    # Пропускаем закрепленный пост
-    if post.get("is_pinned"):
-        continue
+    for row_number, record in enumerate(records, start=2):
+        existing_posts[str(record["post_id"])] = row_number
 
-    post_id = str(post["id"])
+    url = "https://api.vk.com/method/wall.get"
 
-    date = datetime.fromtimestamp(
-        post["date"]
-    ).strftime("%Y-%m-%d %H:%M:%S")
+    params = {
+        "domain": DOMAIN,
+        "count": 100,
+        "access_token": VK_TOKEN,
+        "v": "5.199"
+    }
 
-    text = post.get("text", "")
+    response = requests.get(url, params=params)
+    data = response.json()
 
-    # 🚨 ПРОПУСК ПУСТЫХ ПОСТОВ
-    if not text.strip():
-        continue
+    posts = data["response"]["items"]
+    posts.sort(key=lambda x: x["date"])
 
-    reactions = post.get("reactions", {}).get("count", 0)
-    comments = post.get("comments", {}).get("count", 0)
-    reposts = post.get("reposts", {}).get("count", 0)
-    views = post.get("views", {}).get("count", 0)
+    for post in posts:
 
-    # ==========================================
-    # СЧИТАЕМ CR
-    # ==========================================
+        if post.get("is_pinned"):
+            continue
 
-    if views > 0:
-        cr = round(((reactions + comments + reposts) / views) * 100, 2)
-    else:
-        cr = 0
+        post_id = str(post["id"])
+        date = datetime.fromtimestamp(post["date"]).strftime("%Y-%m-%d %H:%M:%S")
+        text = post.get("text", "")
 
-    # ==========================================
-    # ОБНОВЛЕНИЕ
-    # ==========================================
+        if not text.strip():
+            continue
 
-    if post_id in existing_posts:
+        reactions = post.get("reactions", {}).get("count", 0)
+        comments = post.get("comments", {}).get("count", 0)
+        reposts = post.get("reposts", {}).get("count", 0)
+        views = post.get("views", {}).get("count", 0)
 
-        row = existing_posts[post_id]
+        cr = round(((reactions + comments + reposts) / views) * 100, 2) if views else 0
 
-        batch_updates.append({
-            "range": f"C{row}:H{row}",
-            "values": [[
-                reactions,
-                comments,
-                reposts,
-                views,
-                cr,
-                text
-            ]]
-        })
+        if post_id in existing_posts:
+            row = existing_posts[post_id]
 
-        updated_posts += 1
+            sheet.batch_update([{
+                "range": f"C{row}:H{row}",
+                "values": [[reactions, comments, reposts, views, cr, text]]
+            }])
 
-    # ==========================================
-    # ДОБАВЛЕНИЕ
-    # ==========================================
+        else:
+            sheet.append_row([
+                date, post_id, reactions, comments, reposts, views, cr, text
+            ])
 
-    else:
-
-        rows_to_add.append([
-            date,
-            post_id,
-            reactions,
-            comments,
-            reposts,
-            views,
-            cr,
-            text
-        ])
-
-        new_posts += 1
 
 # ==========================================
-# ОТПРАВЛЯЕМ ОБНОВЛЕНИЯ
+# HEALTH CHECK (обязательно для Render)
 # ==========================================
 
-if batch_updates:
-    sheet.batch_update(batch_updates)
+@app.route("/", methods=["GET"])
+def home():
+    return "VK bot running"
+
 
 # ==========================================
-# ДОБАВЛЯЕМ НОВЫЕ ПОСТЫ
+# START
 # ==========================================
 
-if rows_to_add:
-    sheet.append_rows(
-        rows_to_add,
-        value_input_option="USER_ENTERED"
-    )
-
-# ==========================================
-# ЛОГ
-# ==========================================
-
-print("-" * 40)
-print(f"Всего постов VK: {len(posts)}")
-print(f"Обновлено: {updated_posts}")
-print(f"Добавлено: {new_posts}")
-print("Готово.")
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
